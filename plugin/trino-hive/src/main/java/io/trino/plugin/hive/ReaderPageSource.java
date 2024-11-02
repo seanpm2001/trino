@@ -13,8 +13,11 @@
  */
 package io.trino.plugin.hive;
 
+import com.google.common.collect.ImmutableList;
+import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 
+import java.util.List;
 import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
@@ -37,9 +40,34 @@ public class ReaderPageSource
         this.columns = requireNonNull(columns, "columns is null");
     }
 
-    public ConnectorPageSource get()
+    public ConnectorPageSource getUnprojectedPageSource()
     {
+        if (columns.isPresent()) {
+            throw new IllegalStateException("Projection columns are present");
+        }
         return connectorPageSource;
+    }
+
+    public ConnectorPageSource getProjectedPageSource(List<? extends ColumnHandle> expectedColumns, ProjectionGetter projectionGetter)
+    {
+        if (columns.isEmpty()) {
+            return connectorPageSource;
+        }
+
+        ReaderColumns readColumns = columns.get();
+        TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
+        for (int i = 0; i < expectedColumns.size(); i++) {
+            transforms.dereferenceField(ImmutableList.<Integer>builder()
+                    .add(readColumns.getPositionForColumnAt(i))
+                    .addAll(projectionGetter.get(expectedColumns.get(i), readColumns.getForColumnAt(i)))
+                    .build());
+        }
+        return transforms.build(connectorPageSource);
+    }
+
+    public interface ProjectionGetter
+    {
+        List<Integer> get(ColumnHandle required, ColumnHandle read);
     }
 
     public Optional<ReaderColumns> getReaderColumns()

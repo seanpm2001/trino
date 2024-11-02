@@ -45,6 +45,7 @@ import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.DynamicFilter;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.Type;
 import io.trino.sql.gen.ExpressionCompiler;
@@ -204,7 +205,7 @@ public class TestOrcPageSourceMemoryTracking
         int totalRows = 0;
         while (totalRows < 20000) {
             assertThat(pageSource.isFinished()).isFalse();
-            Page page = pageSource.getNextPage();
+            SourcePage page = pageSource.getNextSourcePage();
             assertThat(page).isNotNull();
             Block block = page.getBlock(1);
 
@@ -237,7 +238,7 @@ public class TestOrcPageSourceMemoryTracking
         memoryUsage = -1;
         while (totalRows < 40000) {
             assertThat(pageSource.isFinished()).isFalse();
-            Page page = pageSource.getNextPage();
+            SourcePage page = pageSource.getNextSourcePage();
             assertThat(page).isNotNull();
             Block block = page.getBlock(1);
 
@@ -270,7 +271,7 @@ public class TestOrcPageSourceMemoryTracking
         memoryUsage = -1;
         while (totalRows < NUM_ROWS) {
             assertThat(pageSource.isFinished()).isFalse();
-            Page page = pageSource.getNextPage();
+            SourcePage page = pageSource.getNextSourcePage();
             assertThat(page).isNotNull();
             Block block = page.getBlock(1);
 
@@ -301,7 +302,7 @@ public class TestOrcPageSourceMemoryTracking
         }
 
         assertThat(pageSource.isFinished()).isFalse();
-        assertThat(pageSource.getNextPage()).isNull();
+        assertThat(pageSource.getNextSourcePage()).isNull();
         assertThat(pageSource.isFinished()).isTrue();
         if (useCache) {
             // file is fully cached
@@ -358,12 +359,13 @@ public class TestOrcPageSourceMemoryTracking
         try {
             int positionCount = 0;
             while (true) {
-                Page page = pageSource.getNextPage();
+                SourcePage page = pageSource.getNextSourcePage();
                 if (pageSource.isFinished()) {
                     break;
                 }
                 assertThat(page).isNotNull();
-                page = page.getLoadedPage();
+                // load all page data
+                page.getPage();
                 positionCount += page.getPositionCount();
                 // assert upper bound is tight
                 // ignore the first MAX_BATCH_SIZE rows given the sizes are set when loading the blocks

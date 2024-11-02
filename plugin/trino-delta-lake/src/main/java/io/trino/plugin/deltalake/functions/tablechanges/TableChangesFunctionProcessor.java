@@ -21,14 +21,16 @@ import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.filesystem.TrinoInputFile;
 import io.trino.parquet.ParquetReaderOptions;
 import io.trino.plugin.deltalake.DeltaLakeColumnHandle;
-import io.trino.plugin.deltalake.DeltaLakePageSource;
+import io.trino.plugin.deltalake.DeltaLakePageSourceProvider;
 import io.trino.plugin.hive.FileFormatDataSourceStats;
-import io.trino.plugin.hive.ReaderPageSource;
+import io.trino.plugin.hive.HiveColumnHandle;
 import io.trino.plugin.hive.parquet.ParquetPageSourceFactory;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
+import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.function.table.TableFunctionProcessorState;
 import io.trino.spi.function.table.TableFunctionSplitProcessor;
 import io.trino.spi.predicate.TupleDomain;
@@ -40,7 +42,6 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 
-import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.plugin.deltalake.DeltaLakeCdfPageSink.CHANGE_TYPE_COLUMN_NAME;
@@ -68,7 +69,7 @@ public class TableChangesFunctionProcessor
     private static final Page EMPTY_PAGE = new Page(0);
 
     private final TableChangesFileType fileType;
-    private final DeltaLakePageSource deltaLakePageSource;
+    private final ConnectorPageSource deltaLakePageSource;
     private final Block currentVersionAsBlock;
     private final Block currentVersionCommitTimestampAsBlock;
 
@@ -117,7 +118,7 @@ public class TableChangesFunctionProcessor
 
     private TableFunctionProcessorState processCdfFile()
     {
-        Page page = deltaLakePageSource.getNextPage();
+        SourcePage page = deltaLakePageSource.getNextSourcePage();
         if (page != null) {
             int filePageColumns = page.getChannelCount();
             Block[] resultBlock = new Block[filePageColumns + NUMBER_OF_ADDITIONAL_COLUMNS_FOR_CDF_FILE];
@@ -138,7 +139,7 @@ public class TableChangesFunctionProcessor
 
     private TableFunctionProcessorState processDataFile()
     {
-        Page page = deltaLakePageSource.getNextPage();
+        SourcePage page = deltaLakePageSource.getNextSourcePage();
         if (page != null) {
             int filePageColumns = page.getChannelCount();
             Block[] blocks = new Block[filePageColumns + NUMBER_OF_ADDITIONAL_COLUMNS_FOR_DATA_FILE];
@@ -159,7 +160,7 @@ public class TableChangesFunctionProcessor
         return TableFunctionProcessorState.Processed.produced(EMPTY_PAGE);
     }
 
-    private static DeltaLakePageSource createDeltaLakePageSource(
+    private static ConnectorPageSource createDeltaLakePageSource(
             ConnectorSession session,
             TrinoFileSystemFactory fileSystemFactory,
             DateTimeZone parquetDateTimeZone,
@@ -193,11 +194,12 @@ public class TableChangesFunctionProcessor
             case DATA_FILE -> handle.columns();
         };
 
-        ReaderPageSource pageSource = ParquetPageSourceFactory.createPageSource(
+        List<HiveColumnHandle> hiveColumnHandles = splitColumns.stream().filter(column -> column.columnType() == REGULAR).map(DeltaLakeColumnHandle::toHiveColumnHandle).collect(toImmutableList());
+        ConnectorPageSource pageSource = ParquetPageSourceFactory.createPageSource(
                 inputFile,
                 0,
                 split.fileSize(),
-                splitColumns.stream().filter(column -> column.columnType() == REGULAR).map(DeltaLakeColumnHandle::toHiveColumnHandle).collect(toImmutableList()),
+                hiveColumnHandles,
                 ImmutableList.of(TupleDomain.all()), // TODO add predicate pushdown https://github.com/trinodb/trino/issues/16990
                 true,
                 parquetDateTimeZone,
@@ -205,20 +207,17 @@ public class TableChangesFunctionProcessor
                 parquetReaderOptions,
                 Optional.empty(),
                 domainCompactionThreshold,
-                OptionalLong.empty());
+                OptionalLong.empty())
+                .getUnprojectedPageSource();
 
-        verify(pageSource.getReaderColumns().isEmpty(), "Unexpected reader columns: %s", pageSource.getReaderColumns().orElse(null));
-
-        return new DeltaLakePageSource(
+        return DeltaLakePageSourceProvider.projectColumns(
                 splitColumns,
                 ImmutableSet.of(),
                 partitionKeys,
                 Optional.empty(),
-                pageSource.get(),
-                Optional.empty(),
+                pageSource,
                 split.path(),
                 split.fileSize(),
-                0L,
-                Optional::empty);
+                0);
     }
 }

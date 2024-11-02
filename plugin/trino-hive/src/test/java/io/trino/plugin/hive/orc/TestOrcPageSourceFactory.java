@@ -27,8 +27,8 @@ import io.trino.plugin.hive.HiveConfig;
 import io.trino.plugin.hive.HivePageSourceFactory;
 import io.trino.plugin.hive.ReaderPageSource;
 import io.trino.plugin.hive.Schema;
-import io.trino.spi.Page;
 import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.ConnectorIdentity;
@@ -267,7 +267,7 @@ public class TestOrcPageSourceFactory
         checkArgument(pageSourceWithProjections.get().getReaderColumns().isEmpty(),
                 "projected columns not expected here");
 
-        ConnectorPageSource pageSource = pageSourceWithProjections.get().get();
+        ConnectorPageSource pageSource = pageSourceWithProjections.get().getUnprojectedPageSource();
 
         int nationKeyColumn = columnNames.indexOf("n_nationkey");
         int nameColumn = columnNames.indexOf("n_name");
@@ -276,12 +276,11 @@ public class TestOrcPageSourceFactory
 
         ImmutableList.Builder<Nation> rows = ImmutableList.builder();
         while (!pageSource.isFinished()) {
-            Page page = pageSource.getNextPage();
+            SourcePage page = pageSource.getNextSourcePage();
             if (page == null) {
                 continue;
             }
 
-            page = page.getLoadedPage();
             for (int position = 0; position < page.getPositionCount(); position++) {
                 long nationKey = -42;
                 if (nationKeyColumn >= 0) {

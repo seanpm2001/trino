@@ -104,7 +104,7 @@ final class ParquetUtil
                         false,
                         NO_ACID_TRANSACTION)
                 .orElseThrow()
-                .get();
+                .getUnprojectedPageSource();
     }
 
     private static List<HiveColumnHandle> getBaseColumns(List<String> columnNames, List<Type> columnTypes)

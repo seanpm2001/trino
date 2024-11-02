@@ -155,4 +155,32 @@ public class TestIcebergConnectorSmokeTest
                 """.formatted(mergeTable.getName(), table.getName(), matchedClause, notMatchedClause),
                 1);
     }
+
+    @Test
+    void testStuff()
+    {
+        assertUpdate(
+             """
+             CREATE TABLE foo (_string VARCHAR, _bigint BIGINT, _struct ROW(_field INT, _another_field VARCHAR))
+                WITH (partitioning = ARRAY['"_struct._field"'], format = 'ORC')
+             """
+        );
+        assertUpdate(
+                """
+                INSERT INTO foo VALUES
+                        ('update', 1001, ROW(1, 'x')),
+                        ('b', 1002, ROW(2, 'y')),
+                        ('c', 1003, ROW(3, 'z'))
+                """,
+                3);
+        assertQuery(
+                """
+                SELECT _struct._another_field FROM foo
+                """,
+                """
+                VALUES 'x', 'y', 'z'
+                """);
+        assertUpdate("UPDATE foo SET _string = 'a' WHERE _struct._field = 1", 1);
+        assertUpdate("DELETE FROM foo WHERE _struct._another_field = 'y'", 1);
+    }
 }

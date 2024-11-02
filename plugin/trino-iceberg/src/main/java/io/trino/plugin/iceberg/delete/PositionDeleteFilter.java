@@ -15,9 +15,9 @@ package io.trino.plugin.iceberg.delete;
 
 import io.airlift.slice.Slice;
 import io.trino.plugin.iceberg.IcebergColumnHandle;
-import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.SourcePage;
 import org.roaringbitmap.longlong.ImmutableLongBitmapDataProvider;
 import org.roaringbitmap.longlong.LongBitmapDataProvider;
 
@@ -66,7 +66,7 @@ public final class PositionDeleteFilter
         // entries for a single path. The comparison cost is minimal due if the
         // path values are dictionary encoded, since we only do the comparison once.
         while (!pageSource.isFinished()) {
-            Page page = pageSource.getNextPage();
+            SourcePage page = pageSource.getNextSourcePage();
             if (page == null) {
                 continue;
             }

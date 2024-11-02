@@ -34,6 +34,7 @@ import io.trino.plugin.hive.FileFormatDataSourceStats;
 import io.trino.plugin.hive.HiveColumnHandle;
 import io.trino.plugin.hive.HivePartitionKey;
 import io.trino.plugin.hive.ReaderColumns;
+import io.trino.plugin.hive.TransformConnectorPageSource;
 import io.trino.plugin.hive.parquet.ParquetReaderConfig;
 import io.trino.plugin.hudi.model.HudiFileFormat;
 import io.trino.spi.TrinoException;
@@ -65,7 +66,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.TimeZone;
-import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static io.airlift.slice.Slices.utf8Slice;
@@ -74,6 +74,14 @@ import static io.trino.parquet.ParquetTypeUtils.getColumnIO;
 import static io.trino.parquet.ParquetTypeUtils.getDescriptors;
 import static io.trino.parquet.predicate.PredicateUtils.buildPredicate;
 import static io.trino.parquet.predicate.PredicateUtils.getFilteredRowGroups;
+import static io.trino.plugin.hive.HiveColumnHandle.FILE_MODIFIED_TIME_COLUMN_NAME;
+import static io.trino.plugin.hive.HiveColumnHandle.FILE_MODIFIED_TIME_TYPE_SIGNATURE;
+import static io.trino.plugin.hive.HiveColumnHandle.FILE_SIZE_COLUMN_NAME;
+import static io.trino.plugin.hive.HiveColumnHandle.FILE_SIZE_TYPE_SIGNATURE;
+import static io.trino.plugin.hive.HiveColumnHandle.PARTITION_COLUMN_NAME;
+import static io.trino.plugin.hive.HiveColumnHandle.PARTITION_TYPE_SIGNATURE;
+import static io.trino.plugin.hive.HiveColumnHandle.PATH_COLUMN_NAME;
+import static io.trino.plugin.hive.HiveColumnHandle.PATH_TYPE;
 import static io.trino.plugin.hive.HivePageSourceProvider.projectBaseColumns;
 import static io.trino.plugin.hive.parquet.ParquetPageSourceFactory.ParquetReaderProvider;
 import static io.trino.plugin.hive.parquet.ParquetPageSourceFactory.createDataSource;
@@ -91,6 +99,7 @@ import static io.trino.plugin.hudi.HudiSessionProperties.isParquetVectorizedDeco
 import static io.trino.plugin.hudi.HudiSessionProperties.shouldUseParquetColumnNames;
 import static io.trino.plugin.hudi.HudiUtil.getHudiFileFormat;
 import static io.trino.spi.predicate.Utils.nativeValueToBlock;
+import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static io.trino.spi.type.StandardTypes.BIGINT;
 import static io.trino.spi.type.StandardTypes.BOOLEAN;
 import static io.trino.spi.type.StandardTypes.DATE;
@@ -103,6 +112,7 @@ import static io.trino.spi.type.StandardTypes.TIMESTAMP;
 import static io.trino.spi.type.StandardTypes.TINYINT;
 import static io.trino.spi.type.StandardTypes.VARBINARY;
 import static io.trino.spi.type.StandardTypes.VARCHAR;
+import static io.trino.spi.type.TimeZoneKey.UTC_KEY;
 import static java.lang.Double.parseDouble;
 import static java.lang.Float.floatToRawIntBits;
 import static java.lang.Float.parseFloat;
@@ -158,10 +168,10 @@ public class HudiPageSourceProvider
         // for partition columns, separate blocks will be created
         List<HiveColumnHandle> regularColumns = hiveColumns.stream()
                 .filter(columnHandle -> !columnHandle.isPartitionKey() && !columnHandle.isHidden())
-                .collect(Collectors.toList());
+                .collect(toList());
         TrinoFileSystem fileSystem = fileSystemFactory.create(session);
         TrinoInputFile inputFile = fileSystem.newInputFile(Location.of(path), split.getFileSize());
-        ConnectorPageSource dataPageSource = createPageSource(
+        ConnectorPageSource pageSource = createPageSource(
                 session,
                 regularColumns,
                 split,
@@ -171,14 +181,34 @@ public class HudiPageSourceProvider
                         .withVectorizedDecodingEnabled(isParquetVectorizedDecodingEnabled(session)),
                 timeZone);
 
-        return new HudiPageSource(
-                toPartitionName(split.getPartitionKeys()),
-                hiveColumns,
-                convertPartitionValues(hiveColumns, split.getPartitionKeys()), // create blocks for partition values
-                dataPageSource,
-                path,
-                split.getFileSize(),
-                split.getFileModifiedTime());
+        Map<String, Block> partitionBlocks = convertPartitionValues(hiveColumns, split.getPartitionKeys());
+
+        TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
+        int delegateIndex = 0;
+        for (HiveColumnHandle column : hiveColumns) {
+            if (partitionBlocks.containsKey(column.getName())) {
+                transforms.constantValue(partitionBlocks.get(column.getName()));
+            }
+            else if (column.getName().equals(PARTITION_COLUMN_NAME)) {
+                transforms.constantValue(nativeValueToBlock(PARTITION_TYPE_SIGNATURE, utf8Slice(toPartitionName(split.getPartitionKeys()))));
+            }
+            else if (column.getName().equals(PATH_COLUMN_NAME)) {
+                transforms.constantValue(nativeValueToBlock(PATH_TYPE, utf8Slice(path)));
+            }
+            else if (column.getName().equals(FILE_SIZE_COLUMN_NAME)) {
+                transforms.constantValue(nativeValueToBlock(FILE_SIZE_TYPE_SIGNATURE, split.getFileSize()));
+            }
+            else if (column.getName().equals(FILE_MODIFIED_TIME_COLUMN_NAME)) {
+                long packedTimestamp = packDateTimeWithZone(split.getFileModifiedTime(), UTC_KEY);
+                transforms.constantValue(nativeValueToBlock(FILE_MODIFIED_TIME_TYPE_SIGNATURE, packedTimestamp));
+            }
+            else {
+                transforms.column(delegateIndex);
+                delegateIndex++;
+            }
+        }
+
+        return transforms.build(pageSource);
     }
 
     private static ConnectorPageSource createPageSource(
@@ -234,9 +264,10 @@ public class HudiPageSourceProvider
                     .orElse(columns);
             ParquetDataSourceId dataSourceId = dataSource.getId();
             ParquetDataSource finalDataSource = dataSource;
-            ParquetReaderProvider parquetReaderProvider = fields -> new ParquetReader(
+            ParquetReaderProvider parquetReaderProvider = (fields, appendRowNumberColumn) -> new ParquetReader(
                     Optional.ofNullable(fileMetaData.getCreatedBy()),
                     fields,
+                    appendRowNumberColumn,
                     rowGroups,
                     finalDataSource,
                     timeZone,

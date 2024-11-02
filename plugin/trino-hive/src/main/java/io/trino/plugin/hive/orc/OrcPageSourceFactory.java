@@ -42,14 +42,18 @@ import io.trino.plugin.hive.HivePageSourceFactory;
 import io.trino.plugin.hive.ReaderColumns;
 import io.trino.plugin.hive.ReaderPageSource;
 import io.trino.plugin.hive.Schema;
+import io.trino.plugin.hive.TransformConnectorPageSource;
 import io.trino.plugin.hive.acid.AcidSchema;
 import io.trino.plugin.hive.acid.AcidTransaction;
 import io.trino.plugin.hive.coercions.TypeCoercer;
-import io.trino.plugin.hive.orc.OrcPageSource.ColumnAdaptation;
 import io.trino.spi.TrinoException;
+import io.trino.spi.block.Block;
+import io.trino.spi.block.LongArrayBlock;
+import io.trino.spi.block.RunLengthEncodedBlock;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.EmptyPageSource;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.Type;
@@ -62,6 +66,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -83,6 +88,9 @@ import static io.trino.plugin.hive.HiveColumnHandle.ColumnType.REGULAR;
 import static io.trino.plugin.hive.HiveErrorCode.HIVE_BAD_DATA;
 import static io.trino.plugin.hive.HiveErrorCode.HIVE_CANNOT_OPEN_SPLIT;
 import static io.trino.plugin.hive.HiveErrorCode.HIVE_FILE_MISSING_COLUMN_NAMES;
+import static io.trino.plugin.hive.HivePageSourceProvider.BUCKET_CHANNEL;
+import static io.trino.plugin.hive.HivePageSourceProvider.ORIGINAL_TRANSACTION_CHANNEL;
+import static io.trino.plugin.hive.HivePageSourceProvider.ROW_ID_CHANNEL;
 import static io.trino.plugin.hive.HivePageSourceProvider.projectBaseColumns;
 import static io.trino.plugin.hive.HiveSessionProperties.getOrcLazyReadSmallRanges;
 import static io.trino.plugin.hive.HiveSessionProperties.getOrcMaxBufferSize;
@@ -93,11 +101,13 @@ import static io.trino.plugin.hive.HiveSessionProperties.getOrcTinyStripeThresho
 import static io.trino.plugin.hive.HiveSessionProperties.isOrcBloomFiltersEnabled;
 import static io.trino.plugin.hive.HiveSessionProperties.isOrcNestedLazy;
 import static io.trino.plugin.hive.HiveSessionProperties.isUseOrcColumnNames;
-import static io.trino.plugin.hive.orc.OrcPageSource.ColumnAdaptation.mergedRowColumns;
+import static io.trino.plugin.hive.orc.OrcFileWriter.computeBucketValue;
 import static io.trino.plugin.hive.orc.OrcPageSource.handleException;
 import static io.trino.plugin.hive.orc.OrcTypeTranslator.createCoercer;
 import static io.trino.plugin.hive.util.HiveUtil.splitError;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static io.trino.spi.block.RowBlock.fromFieldBlocks;
+import static io.trino.spi.predicate.Utils.nativeValueToBlock;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static java.lang.String.format;
@@ -112,6 +122,7 @@ import static java.util.stream.Collectors.toUnmodifiableList;
 public class OrcPageSourceFactory
         implements HivePageSourceFactory
 {
+    private static final Block ORIGINAL_FILE_TRANSACTION_ID_BLOCK = nativeValueToBlock(BIGINT, 0L);
     private static final Pattern DEFAULT_HIVE_COLUMN_NAME_PATTERN = Pattern.compile("_col\\d+");
     private final OrcReaderOptions orcReaderOptions;
     private final TrinoFileSystemFactory fileSystemFactory;
@@ -329,7 +340,7 @@ public class OrcPageSourceFactory
                     .setDomainCompactionThreshold(domainCompactionThreshold);
             Map<HiveColumnHandle, Domain> effectivePredicateDomains = effectivePredicate.getDomains()
                     .orElseThrow(() -> new IllegalArgumentException("Effective predicate is none"));
-            List<ColumnAdaptation> columnAdaptations = new ArrayList<>(columns.size());
+            TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
             for (HiveColumnHandle column : columns) {
                 OrcColumn orcColumn = null;
                 OrcReader.ProjectedLayout projectedLayout = null;
@@ -361,10 +372,10 @@ public class OrcPageSourceFactory
                     Optional<TypeCoercer<?, ?>> coercer = createCoercer(orcColumn.getColumnType(), orcColumn.getNestedColumns(), readType);
                     if (coercer.isPresent()) {
                         fileReadTypes.add(coercer.get().getFromType());
-                        columnAdaptations.add(ColumnAdaptation.coercedColumn(sourceIndex, coercer.get()));
+                        transforms.transform(sourceIndex, coercer.get());
                     }
                     else {
-                        columnAdaptations.add(ColumnAdaptation.sourceColumn(sourceIndex));
+                        transforms.column(sourceIndex);
                         fileReadTypes.add(readType);
                     }
                     fileReadColumns.add(orcColumn);
@@ -379,7 +390,29 @@ public class OrcPageSourceFactory
                     }
                 }
                 else {
-                    columnAdaptations.add(ColumnAdaptation.nullColumn(readType));
+                    transforms.constantValue(readType.createNullBlock());
+                }
+            }
+
+            Optional<Long> originalFileRowId = acidInfo
+                    .filter(OrcPageSourceFactory::hasOriginalFiles)
+                    // TODO reduce number of file footer accesses. Currently this is quadratic to the number of original files.
+                    .map(info -> OriginalFilesUtils.getPrecedingRowCount(
+                            acidInfo.get().getOriginalFiles(),
+                            path,
+                            fileSystemFactory,
+                            session.getIdentity(),
+                            options,
+                            stats));
+
+            boolean appendRowNumberColumn = false;
+            if (transaction.isMerge()) {
+                if (originalFile) {
+                    transforms.transform(new MergedRowAdaptationWithOriginalFiles(originalFileRowId.orElse(0L), bucketNumber.orElse(0)));
+                    appendRowNumberColumn = true;
+                }
+                else {
+                    transforms.transform(new MergedRowPageFunction());
                 }
             }
 
@@ -387,6 +420,7 @@ public class OrcPageSourceFactory
                     fileReadColumns,
                     fileReadTypes,
                     fileReadLayouts,
+                    appendRowNumberColumn,
                     predicateBuilder.build(),
                     start,
                     length,
@@ -406,37 +440,15 @@ public class OrcPageSourceFactory
                             bucketNumber,
                             memoryUsage));
 
-            Optional<Long> originalFileRowId = acidInfo
-                    .filter(OrcPageSourceFactory::hasOriginalFiles)
-                    // TODO reduce number of file footer accesses. Currently this is quadratic to the number of original files.
-                    .map(info -> OriginalFilesUtils.getPrecedingRowCount(
-                            acidInfo.get().getOriginalFiles(),
-                            path,
-                            fileSystemFactory,
-                            session.getIdentity(),
-                            options,
-                            stats));
-
-            if (transaction.isMerge()) {
-                if (originalFile) {
-                    int bucket = bucketNumber.orElse(0);
-                    long startingRowId = originalFileRowId.orElse(0L);
-                    columnAdaptations.add(OrcPageSource.ColumnAdaptation.mergedRowColumnsWithOriginalFiles(startingRowId, bucket));
-                }
-                else {
-                    columnAdaptations.add(mergedRowColumns());
-                }
-            }
-
-            return new OrcPageSource(
+            ConnectorPageSource pageSource = new OrcPageSource(
                     recordReader,
-                    columnAdaptations,
                     orcDataSource,
                     deletedRows,
                     originalFileRowId,
                     memoryUsage,
                     stats,
                     reader.getCompressionKind());
+            return transforms.build(pageSource);
         }
         catch (Exception e) {
             try {
@@ -539,6 +551,66 @@ public class OrcPageSourceFactory
             throw new TrinoException(
                     HIVE_FILE_MISSING_COLUMN_NAMES,
                     "ORC file does not contain column names in the footer: " + path);
+        }
+    }
+
+    /*
+     * The rowId contains the ACID columns - - originalTransaction, rowId, bucket
+     */
+    private static final class MergedRowPageFunction
+            implements Function<SourcePage, Block>
+    {
+        @Override
+        public Block apply(SourcePage page)
+        {
+            return fromFieldBlocks(
+                    page.getPositionCount(),
+                    new Block[] {
+                            page.getBlock(ORIGINAL_TRANSACTION_CHANNEL),
+                            page.getBlock(BUCKET_CHANNEL),
+                            page.getBlock(ROW_ID_CHANNEL)
+                    });
+        }
+    }
+
+    /**
+     * The rowId contains the ACID columns - - originalTransaction, rowId, bucket,
+     * derived from the original file.  The transactionId is always zero,
+     * and the rowIds count up from the startingRowId.
+     */
+    private static final class MergedRowAdaptationWithOriginalFiles
+            implements Function<SourcePage, Block>
+    {
+        private final long startingRowId;
+        private final Block bucketBlock;
+
+        public MergedRowAdaptationWithOriginalFiles(long startingRowId, int bucketId)
+        {
+            this.startingRowId = startingRowId;
+            this.bucketBlock = nativeValueToBlock(INTEGER, (long) computeBucketValue(bucketId, 0));
+        }
+
+        @Override
+        public Block apply(SourcePage sourcePage)
+        {
+            int positionCount = sourcePage.getPositionCount();
+
+            LongArrayBlock rowNumberBlock = (LongArrayBlock) sourcePage.getBlock(sourcePage.getChannelCount() - 1);
+            if (startingRowId != 0) {
+                long[] newRowNumbers = new long[rowNumberBlock.getPositionCount()];
+                for (int index = 0; index < rowNumberBlock.getPositionCount(); index++) {
+                    newRowNumbers[index] = startingRowId + rowNumberBlock.getLong(index);
+                }
+                rowNumberBlock = new LongArrayBlock(rowNumberBlock.getPositionCount(), Optional.empty(), newRowNumbers);
+            }
+
+            return fromFieldBlocks(
+                    positionCount,
+                    new Block[] {
+                            RunLengthEncodedBlock.create(ORIGINAL_FILE_TRANSACTION_ID_BLOCK, positionCount),
+                            RunLengthEncodedBlock.create(bucketBlock, positionCount),
+                            rowNumberBlock
+                    });
         }
     }
 

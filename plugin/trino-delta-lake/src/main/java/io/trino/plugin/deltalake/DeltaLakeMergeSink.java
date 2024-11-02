@@ -32,7 +32,6 @@ import io.trino.parquet.writer.ParquetWriterOptions;
 import io.trino.plugin.deltalake.delete.RoaringBitmapArray;
 import io.trino.plugin.deltalake.transactionlog.DeletionVectorEntry;
 import io.trino.plugin.hive.FileFormatDataSourceStats;
-import io.trino.plugin.hive.ReaderPageSource;
 import io.trino.plugin.hive.parquet.ParquetFileWriter;
 import io.trino.plugin.hive.parquet.ParquetPageSourceFactory;
 import io.trino.plugin.hive.parquet.TrinoParquetDataSource;
@@ -44,6 +43,7 @@ import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.connector.ConnectorPageSink;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeOperators;
@@ -364,7 +364,7 @@ public class DeltaLakeMergeSink
         deletedRows.or(rowsDeletedByUpdate);
 
         if (cdfEnabled) {
-            try (ConnectorPageSource connectorPageSource = createParquetPageSource(Location.of(path.toStringUtf8())).get()) {
+            try (ConnectorPageSource connectorPageSource = createParquetPageSource(Location.of(path.toStringUtf8()))) {
                 readConnectorPageSource(
                         connectorPageSource,
                         rowsDeletedByDelete,
@@ -538,7 +538,7 @@ public class DeltaLakeMergeSink
     {
         RoaringBitmapArray rowsDeletedByDelete = deletion.rowsDeletedByDelete();
         RoaringBitmapArray rowsDeletedByUpdate = deletion.rowsDeletedByUpdate();
-        try (ConnectorPageSource connectorPageSource = createParquetPageSource(path).get()) {
+        try (ConnectorPageSource connectorPageSource = createParquetPageSource(path)) {
             readConnectorPageSource(
                     connectorPageSource,
                     rowsDeletedByDelete,
@@ -579,10 +579,12 @@ public class DeltaLakeMergeSink
     {
         long filePosition = 0;
         while (!connectorPageSource.isFinished()) {
-            Page page = connectorPageSource.getNextPage();
-            if (page == null) {
+            SourcePage sourcePage = connectorPageSource.getNextSourcePage();
+            if (sourcePage == null) {
                 continue;
             }
+            // fully load page
+            Page page = sourcePage.getPage();
 
             int positionCount = page.getPositionCount();
             int[] retained = new int[positionCount];
@@ -624,14 +626,14 @@ public class DeltaLakeMergeSink
             if (cdfPageSink == null) {
                 cdfPageSink = cdfPageSinkSupplier.get();
             }
-            Page cdfPage = page.getPositions(deleted, 0, deletedCount);
+            page = page.getPositions(deleted, 0, deletedCount);
             Block[] outputBlocks = new Block[nonSynthesizedColumns.size() + 1];
             int cdfPageIndex = 0;
             int partitionIndex = 0;
             List<String> partitionValues = deletion.partitionValues;
             for (int i = 0; i < nonSynthesizedColumns.size(); i++) {
                 if (nonSynthesizedColumns.get(i).columnType() == REGULAR) {
-                    outputBlocks[i] = cdfPage.getBlock(cdfPageIndex);
+                    outputBlocks[i] = page.getBlock(cdfPageIndex);
                     cdfPageIndex++;
                 }
                 else {
@@ -640,18 +642,18 @@ public class DeltaLakeMergeSink
                                     deserializePartitionValue(
                                             nonSynthesizedColumns.get(i),
                                             Optional.ofNullable(partitionValues.get(partitionIndex)))),
-                            cdfPage.getPositionCount());
+                            page.getPositionCount());
                     partitionIndex++;
                 }
             }
             Block cdfOperationBlock = RunLengthEncodedBlock.create(
-                    nativeValueToBlock(VARCHAR, utf8Slice(operation)), cdfPage.getPositionCount());
+                    nativeValueToBlock(VARCHAR, utf8Slice(operation)), page.getPositionCount());
             outputBlocks[nonSynthesizedColumns.size()] = cdfOperationBlock;
-            cdfPageSink.appendPage(new Page(cdfPage.getPositionCount(), outputBlocks));
+            cdfPageSink.appendPage(new Page(page.getPositionCount(), outputBlocks));
         }
     }
 
-    private ReaderPageSource createParquetPageSource(Location path)
+    private ConnectorPageSource createParquetPageSource(Location path)
             throws IOException
     {
         TrinoInputFile inputFile = fileSystem.newInputFile(path);
@@ -670,7 +672,8 @@ public class DeltaLakeMergeSink
                 new ParquetReaderOptions().withBloomFilter(false),
                 Optional.empty(),
                 domainCompactionThreshold,
-                OptionalLong.of(fileSize));
+                OptionalLong.of(fileSize))
+                .getUnprojectedPageSource();
     }
 
     @Override

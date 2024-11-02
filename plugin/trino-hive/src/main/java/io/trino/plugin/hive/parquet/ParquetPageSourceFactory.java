@@ -45,11 +45,14 @@ import io.trino.plugin.hive.HivePageSourceFactory;
 import io.trino.plugin.hive.ReaderColumns;
 import io.trino.plugin.hive.ReaderPageSource;
 import io.trino.plugin.hive.Schema;
+import io.trino.plugin.hive.TransformConnectorPageSource;
 import io.trino.plugin.hive.acid.AcidTransaction;
 import io.trino.plugin.hive.coercions.TypeCoercer;
 import io.trino.spi.TrinoException;
+import io.trino.spi.block.Block;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import org.apache.parquet.column.ColumnDescriptor;
@@ -70,6 +73,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.function.Function;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -270,9 +274,10 @@ public class ParquetPageSourceFactory
 
             ParquetDataSourceId dataSourceId = dataSource.getId();
             ParquetDataSource finalDataSource = dataSource;
-            ParquetReaderProvider parquetReaderProvider = fields -> new ParquetReader(
+            ParquetReaderProvider parquetReaderProvider = (fields, appendRowNumberColumn) -> new ParquetReader(
                     Optional.ofNullable(fileMetaData.getCreatedBy()),
                     fields,
+                    appendRowNumberColumn,
                     rowGroups,
                     finalDataSource,
                     timeZone,
@@ -412,7 +417,7 @@ public class ParquetPageSourceFactory
 
     public interface ParquetReaderProvider
     {
-        ParquetReader createParquetReader(List<Column> fields)
+        ParquetReader createParquetReader(List<Column> fields, boolean appendRowNumberColumn)
                 throws IOException;
     }
 
@@ -424,18 +429,20 @@ public class ParquetPageSourceFactory
             ParquetReaderProvider parquetReaderProvider)
             throws IOException
     {
-        ParquetPageSource.Builder pageSourceBuilder = ParquetPageSource.builder();
         ImmutableList.Builder<Column> parquetColumnFieldsBuilder = ImmutableList.builder();
+        TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
+        boolean appendRowNumberColumn = false;
         int sourceChannel = 0;
         for (HiveColumnHandle column : baseColumns) {
             if (column == PARQUET_ROW_INDEX_COLUMN) {
-                pageSourceBuilder.addRowIndexColumn();
+                appendRowNumberColumn = true;
+                transforms.transform(new GetRowPositionFromSource());
                 continue;
             }
             checkArgument(column.getColumnType() == REGULAR, "column type must be REGULAR: %s", column);
             Optional<org.apache.parquet.schema.Type> parquetType = getBaseColumnParquetType(column, fileSchema, useColumnNames);
             if (parquetType.isEmpty()) {
-                pageSourceBuilder.addNullColumn(column.getBaseType());
+                transforms.constantValue(column.getBaseType().createNullBlock());
                 continue;
             }
             String columnName = useColumnNames ? column.getBaseColumnName() : fileSchema.getFields().get(column.getBaseHiveColumnIndex()).getName();
@@ -451,20 +458,21 @@ public class ParquetPageSourceFactory
 
             Optional<Field> field = constructField(readType, columnIO);
             if (field.isEmpty()) {
-                pageSourceBuilder.addNullColumn(readType);
+                transforms.constantValue(readType.createNullBlock());
                 continue;
             }
             parquetColumnFieldsBuilder.add(new Column(columnName, field.get()));
             if (coercer.isPresent()) {
-                pageSourceBuilder.addCoercedColumn(sourceChannel, coercer.get());
+                transforms.transform(sourceChannel, coercer.get());
             }
             else {
-                pageSourceBuilder.addSourceColumn(sourceChannel);
+                transforms.column(sourceChannel);
             }
             sourceChannel++;
         }
-
-        return pageSourceBuilder.build(parquetReaderProvider.createParquetReader(parquetColumnFieldsBuilder.build()));
+        ParquetReader parquetReader = parquetReaderProvider.createParquetReader(parquetColumnFieldsBuilder.build(), appendRowNumberColumn);
+        ConnectorPageSource pageSource = new ParquetPageSource(parquetReader);
+        return transforms.build(pageSource);
     }
 
     private static Optional<org.apache.parquet.schema.Type> getBaseColumnParquetType(HiveColumnHandle column, MessageType messageType, boolean useParquetColumnNames)
@@ -505,5 +513,15 @@ public class ParquetPageSourceFactory
         }
 
         return Optional.of(typeBuilder.build());
+    }
+
+    private record GetRowPositionFromSource()
+            implements Function<SourcePage, Block>
+    {
+        @Override
+        public Block apply(SourcePage page)
+        {
+            return page.getBlock(page.getChannelCount() - 1);
+        }
     }
 }
