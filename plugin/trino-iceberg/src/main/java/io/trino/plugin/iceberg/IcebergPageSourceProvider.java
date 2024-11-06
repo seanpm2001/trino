@@ -290,11 +290,41 @@ public class IcebergPageSourceProvider
             long dataSequenceNumber,
             Optional<NameMapping> nameMapping)
     {
-        Set<IcebergColumnHandle> deleteFilterRequiredColumns = requiredColumnsForDeletes(tableSchema, deletes);
+        // exit early if effective predicate filters out all data
         Map<Integer, Optional<String>> partitionKeys = getPartitionKeys(partitionData, partitionSpec);
+        TupleDomain<IcebergColumnHandle> effectivePredicate = getUnenforcedPredicate(
+                tableSchema,
+                partitionKeys,
+                dynamicFilter,
+                unenforcedPredicate,
+                fileStatisticsDomain);
+        if (effectivePredicate.isNone()) {
+            return new EmptyPageSource();
+        }
+
+        // exit early when only reading partition keys from a simple split
+        TrinoFileSystem fileSystem = fileSystemFactory.create(session.getIdentity(), fileIoProperties);
+        TrinoInputFile inputfile = isUseFileSizeFromMetadata(session)
+                ? fileSystem.newInputFile(Location.of(path), fileSize)
+                : fileSystem.newInputFile(Location.of(path));
+        try {
+            if (effectivePredicate.isAll() &&
+                    start == 0 && length == inputfile.length() &&
+                    deletes.isEmpty() &&
+                    icebergColumns.stream().allMatch(column -> partitionKeys.containsKey(column.getId()))) {
+                return generatePages(
+                        fileRecordCount,
+                        icebergColumns,
+                        partitionKeys);
+            }
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
 
         List<IcebergColumnHandle> requiredColumns = new ArrayList<>(icebergColumns);
 
+        Set<IcebergColumnHandle> deleteFilterRequiredColumns = requiredColumnsForDeletes(tableSchema, deletes);
         deleteFilterRequiredColumns.stream()
                 .filter(not(icebergColumns::contains))
                 .forEach(requiredColumns::add);
@@ -326,36 +356,6 @@ public class IcebergPageSourceProvider
                         }
                     }
                 });
-
-        TupleDomain<IcebergColumnHandle> effectivePredicate = getUnenforcedPredicate(
-                tableSchema,
-                partitionKeys,
-                dynamicFilter,
-                unenforcedPredicate,
-                fileStatisticsDomain);
-        if (effectivePredicate.isNone()) {
-            return new EmptyPageSource();
-        }
-
-        TrinoFileSystem fileSystem = fileSystemFactory.create(session.getIdentity(), fileIoProperties);
-        TrinoInputFile inputfile = isUseFileSizeFromMetadata(session)
-                ? fileSystem.newInputFile(Location.of(path), fileSize)
-                : fileSystem.newInputFile(Location.of(path));
-
-        try {
-            if (effectivePredicate.isAll() &&
-                    start == 0 && length == inputfile.length() &&
-                    deletes.isEmpty() &&
-                    icebergColumns.stream().allMatch(column -> partitionKeys.containsKey(column.getId()))) {
-                return generatePages(
-                        fileRecordCount,
-                        icebergColumns,
-                        partitionKeys);
-            }
-        }
-        catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
 
         ReaderPageSourceWithRowPositions readerPageSourceWithRowPositions = createDataPageSource(
                 session,
